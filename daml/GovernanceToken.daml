@@ -1,0 +1,84 @@
+-- | This module defines the core governance token template for the DAO.
+-- The token represents voting power and is designed to be fungible.
+module GovernanceToken where
+
+import DA.Time (Time)
+import DA.Action (getTime)
+import DA.Foldable (foldlA, mapA_)
+import DA.Assert ((assert))
+
+-- | Represents a holding of the DAO's governance token.
+-- This template is designed to be fungible through Split/Merge choices.
+-- The `lastUpdated` timestamp is crucial for taking voting power snapshots
+-- to prevent last-minute vote manipulation (e.g., via flash loans).
+template GovernanceToken
+  with
+    issuer : Party
+      -- ^ The DAO or entity that issues tokens.
+    owner : Party
+      -- ^ The current owner of this token holding.
+    amount : Decimal
+      -- ^ The quantity of tokens held in this contract.
+    lastUpdated: Time
+      -- ^ The timestamp of the last modification to this holding.
+  where
+    signatory issuer, owner
+
+    ensure amount > 0.0
+
+    choice Transfer : ContractId GovernanceToken
+      -- ^ Transfers the entire token holding to a new owner.
+      -- To transfer a partial amount, the owner should first `Split` the holding.
+      with
+        newOwner : Party
+          -- ^ The party to receive the tokens.
+      controller owner
+      do
+        now <- getTime
+        create this with
+          owner = newOwner,
+          lastUpdated = now
+
+    choice Split : (ContractId GovernanceToken, ContractId GovernanceToken)
+      -- ^ Splits a token holding into two separate holdings.
+      with
+        splitAmount : Decimal
+          -- ^ The amount to be split into a new contract.
+      controller owner
+      do
+        ensure splitAmount > 0.0 && splitAmount < amount
+        now <- getTime
+        remainingCid <- create this with
+          amount = amount - splitAmount,
+          lastUpdated = now
+        newCid <- create this with
+          amount = splitAmount,
+          lastUpdated = now
+        return (remainingCid, newCid)
+
+    choice Merge : ContractId GovernanceToken
+      -- ^ Merges multiple token holdings of the same owner into a single one.
+      -- The contract on which this choice is exercised is archived along with
+      -- the contracts specified in `otherCids`.
+      with
+        otherCids : [ContractId GovernanceToken]
+          -- ^ A list of other token contracts to merge with this one.
+      controller owner
+      do
+        -- Fetch and validate all other contracts, then sum up their amounts.
+        -- Start the accumulation with the amount from the current contract.
+        totalAmount <- foldlA (\acc cid -> do
+            otherContract <- fetch cid
+            assert (otherContract.owner == owner && "Cannot merge tokens from different owners.")
+            assert (otherContract.issuer == issuer && "Cannot merge tokens from different issuers.")
+            return (acc + otherContract.amount)
+          ) amount otherCids
+
+        -- Archive the other contracts that were merged.
+        mapA_ archive otherCids
+        now <- getTime
+
+        -- Create the new, single merged contract.
+        create this with
+          amount = totalAmount,
+          lastUpdated = now
