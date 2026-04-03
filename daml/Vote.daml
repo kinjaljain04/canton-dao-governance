@@ -1,0 +1,42 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Vote where
+
+import Daml.Trigger (Trigger)
+import Proposal (Proposal)
+
+-- | Represents the possible choices a voter can make on a proposal.
+data VoteChoice =
+    For
+  | Against
+  | Abstain
+  deriving (Eq, Show, Ord)
+
+-- | A contract representing a single vote cast by a token holder on a specific proposal.
+-- This contract is created when a voter exercises the `Cast_Vote` choice on the `Proposal`
+-- contract. Its primary purpose is to serve as an immutable record of a voting decision.
+-- The composite key ensures that a voter can only cast one vote per proposal.
+template Vote
+  with
+    proposalId : ContractId Proposal
+      -- ^ The unique identifier of the proposal being voted on.
+    voter : Party
+      -- ^ The party who cast the vote. This party must be a governance token holder.
+    voteChoice : VoteChoice
+      -- ^ The decision made by the voter (For, Against, or Abstain).
+    votingPower : Decimal
+      -- ^ The weight of the vote, corresponding to the number of governance tokens
+      -- the voter held at the moment of voting. This "snapshots" the power to
+      -- prevent changes in token balance from affecting an already cast vote.
+    observers : [Party]
+      -- ^ Parties who can observe this vote record. Typically includes the proposer
+      -- and other relevant DAO members.
+
+  where
+    signatory voter
+
+    observer observers
+
+    key (proposalId, voter) : (ContractId Proposal, Party)
+    maintainer key._2
