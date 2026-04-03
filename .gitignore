@@ -1,0 +1,23 @@
+# Daml specific
+.daml/
+dist/
+*.dar
+
+# Node/TypeScript specific
+node_modules/
+.DS_Store
+
+# IDE specific
+.vscode/
+.idea/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build outputs
+build/
+out/
