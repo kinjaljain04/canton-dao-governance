@@ -1,0 +1,184 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module Proposal where
+
+import DA.Time (Time)
+import DA.Assert ((===))
+import GovernanceToken (Token)
+
+-- | Represents the different on-chain actions a proposal can trigger upon success.
+-- In a real-world scenario, the `Action` type would be extended to cover all
+-- possible governable actions within the DAO's ecosystem.
+data Action =
+    -- | Transfers a specified amount from the DAO treasury to a recipient.
+    TransferFromTreasury with
+      recipient : Party
+      amount : Decimal
+      treasuryCid: ContractId Treasury -- Reference to the DAO's treasury contract.
+  | -- | Updates the DAO's quorum threshold for future proposals.
+    UpdateQuorumThreshold with
+      newQuorumThreshold : Decimal
+      daoParametersCid: ContractId DAOParameters -- Reference to the DAO's parameters contract.
+  | -- | Updates the DAO's voting period duration for future proposals.
+    UpdateVotingPeriod with
+      newVotingPeriodSecs : Int
+      daoParametersCid: ContractId DAOParameters -- Reference to the DAO's parameters contract.
+  deriving (Eq, Show)
+
+-- | Represents the lifecycle status of a proposal.
+data ProposalState =
+    Voting      -- The proposal is active and accepting votes.
+  | Succeeded   -- The voting period ended, quorum was met, and the vote passed.
+  | Failed      -- The voting period ended, and the proposal failed (either by vote or lack of quorum).
+  | Executed    -- The proposal was successful and its action has been executed.
+  deriving (Eq, Show)
+
+-- | The core template for a DAO governance proposal.
+-- It encapsulates the proposed action, voting mechanics, and lifecycle state.
+template Proposal
+  with
+    dao: Party                 -- The legal entity or main party of the DAO.
+    proposer: Party            -- The token holder who submitted the proposal.
+    proposalId: Text           -- Unique identifier for the proposal, scoped by the DAO.
+    description: Text          -- Human-readable description of the proposal's purpose.
+    action: Action             -- The on-chain action to be executed if the proposal passes.
+    votingEnd: Time            -- Timestamp when the voting period concludes.
+    quorumThreshold: Decimal   -- Percentage of total supply needed to vote for validity (e.g., 0.1 for 10%).
+    totalTokenSupply: Decimal  -- Total token supply at the moment of proposal creation.
+    votesFor: Decimal          -- Sum of token weights for "yes" votes.
+    votesAgainst: Decimal      -- Sum of token weights for "no" votes.
+    voters: [Party]            -- List of parties who have already cast a vote to prevent double voting.
+    state: ProposalState       -- The current state of the proposal.
+  where
+    signatory dao, proposer
+    observer voters
+
+    key (dao, proposalId) : (Party, Text)
+    maintainer key._1
+
+    ensure
+      totalTokenSupply > 0.0 &&
+      quorumThreshold > 0.0 && quorumThreshold < 1.0
+
+    -- | A token holder exercises this choice to cast their vote.
+    -- The controller must prove ownership of a `GovernanceToken.Token` contract.
+    choice Vote: ContractId Proposal
+      with
+        voterTokenCid: ContractId Token -- The voter provides their token contract to prove ownership and weight.
+        support: Bool                    -- True for a "For" vote, False for an "Against" vote.
+      controller (signatory voterTokenCid)
+      do
+        -- Ensure voting is currently active.
+        now <- getTime
+        assertMsg "Voting period has ended" (now < votingEnd)
+        assertMsg "Proposal is not in a voting state" (state === Voting)
+
+        -- Fetch the voter's token contract to verify ownership and get vote weight.
+        voterToken <- fetch voterTokenCid
+        let voter = voterToken.owner
+        let voteWeight = voterToken.amount
+
+        -- Ensure the voter has not already voted on this proposal.
+        assertMsg "Voter has already voted on this proposal" (notElem voter voters)
+        assertMsg "Voter must hold a positive token balance to vote" (voteWeight > 0.0)
+
+        -- Update vote counts based on the voter's choice and token weight.
+        let newVotesFor = if support then votesFor + voteWeight else votesFor
+        let newVotesAgainst = if not support then votesAgainst + voteWeight else votesAgainst
+
+        -- Recreate the proposal with updated vote counts and voter list.
+        create this with
+          votesFor = newVotesFor
+          votesAgainst = newVotesAgainst
+          voters = voter :: voters
+
+    -- | Anyone can trigger this choice after the voting period to finalize the result.
+    choice Tally: ContractId Proposal
+      controller voters, dao, proposer -- Any interested party can trigger the tally.
+      do
+        -- Ensure the voting period is over and the proposal is ready to be tallied.
+        now <- getTime
+        assertMsg "Voting period has not yet ended" (now >= votingEnd)
+        assertMsg "Proposal is not in a voting state" (state === Voting)
+
+        let totalVotes = votesFor + votesAgainst
+        let quorumMet = (totalVotes / totalTokenSupply) >= quorumThreshold
+        let majorityFor = votesFor > votesAgainst
+
+        -- Determine the final state based on the tally.
+        let newState =
+              if quorumMet && majorityFor then Succeeded
+              else Failed
+
+        create this with state = newState
+
+    -- | The DAO can execute the proposal's action if it succeeded.
+    choice Execute: ContractId Proposal
+      controller dao
+      do
+        assertMsg "Proposal must be in 'Succeeded' state to be executed" (state === Succeeded)
+
+        -- Perform the on-chain action defined in the proposal.
+        case action of
+          TransferFromTreasury recipient amount treasuryCid ->
+            exercise treasuryCid Spend with recipient, amount
+          UpdateQuorumThreshold newQuorumThreshold daoParametersCid ->
+            exercise daoParametersCid UpdateQuorum with newQuorum = newQuorumThreshold
+          UpdateVotingPeriod newVotingPeriodSecs daoParametersCid ->
+            exercise daoParametersCid UpdateVotingPeriod with newPeriod = newVotingPeriodSecs
+
+        -- Transition the proposal to the 'Executed' state to prevent re-execution.
+        create this with state = Executed
+
+
+-- NOTE: The following templates are placeholders to make the `Proposal.Execute` choice
+-- fully functional and compilable. In a complete project, these would reside in their
+-- own respective files (e.g., `Treasury.daml`, `DAO.daml`).
+
+-- | A placeholder for the DAO's treasury contract.
+template Treasury
+  with
+    dao: Party
+    balance: Decimal
+  where
+    signatory dao
+
+    choice Spend: ContractId Treasury
+      with
+        recipient: Party
+        amount: Decimal
+      controller dao
+      do
+        assertMsg "Spend amount must be positive" (amount > 0.0)
+        assertMsg "Insufficient funds in treasury" (amount <= balance)
+        -- In a real implementation, this would likely create an asset contract
+        -- for the recipient rather than just decrementing a balance.
+        create this with balance = balance - amount
+
+-- | A placeholder for the DAO's core parameters contract.
+template DAOParameters
+  with
+    dao: Party
+    quorumThreshold: Decimal
+    votingPeriodSecs: Int
+  where
+    signatory dao
+
+    choice UpdateQuorum: ContractId DAOParameters
+      with
+        newQuorum: Decimal
+      controller dao
+      do
+        assertMsg "New quorum must be between 0.0 and 1.0" (newQuorum > 0.0 && newQuorum < 1.0)
+        create this with quorumThreshold = newQuorum
+
+    choice UpdateVotingPeriod: ContractId DAOParameters
+      with
+        newPeriod: Int
+      controller dao
+      do
+        assertMsg "New voting period must be a positive number of seconds" (newPeriod > 0)
+        create this with votingPeriodSecs = newPeriod
