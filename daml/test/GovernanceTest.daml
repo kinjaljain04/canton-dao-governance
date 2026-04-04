@@ -1,0 +1,218 @@
+-- daml/test/GovernanceTest.daml
+
+module GovernanceTest where
+
+import Daml.Script
+import DA.Date as D
+import DA.Time
+import DA.Assert
+
+import GovernanceToken
+import Proposal
+import Vote
+import Executor
+
+-- | Main test suite for the entire governance lifecycle.
+governanceTest: Script ()
+governanceTest = script do
+  -- === 1. SETUP ===
+  -- Define parties and initial time
+  daoOperator <- allocateParty "DaoOperator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  recipient <- allocateParty "Recipient"
+
+  let now = time (D.date 2024 D.Jan 1) 0 0 0
+  _ <- setTime now
+
+  -- Define governance parameters
+  let
+    totalSupply = 1000.0
+    quorumThreshold = 0.4 -- 40% of total supply must vote
+    majorityThreshold = 0.5 -- >50% of votes must be "For"
+    votingPeriodDays = 7
+    votingPeriodEnd = addRelTime now (days votingPeriodDays)
+
+  -- Issue governance tokens to participants
+  aliceTokenCid <- submit daoOperator do create GovernanceToken with owner = alice, quantity = 500.0, daoOperator
+  bobTokenCid <- submit daoOperator do create GovernanceToken with owner = bob, quantity = 200.0, daoOperator
+  charlieTokenCid <- submit daoOperator do create GovernanceToken with owner = charlie, quantity = 100.0, daoOperator
+
+  -- Create the master executor contract
+  executorMasterCid <- submit daoOperator do create ExecutorMaster with daoOperator, treasury = 10000.0
+
+
+  -- === 2. TEST: SUCCESSFUL PROPOSAL LIFECYCLE ===
+  debug "--- Running Test: Successful Proposal Lifecycle ---"
+  let
+    proposalId1 = "PROP-001"
+    proposalDescription1 = "Spend 1000 from treasury to fund project X."
+    spendAmount1 = 1000.0
+
+  -- Alice submits a treasury spend proposal
+  proposalCid1 <- submit alice do
+    exercise aliceTokenCid SubmitTreasurySpendProposal with
+      proposalId = proposalId1,
+      description = proposalDescription1,
+      recipient,
+      amount = spendAmount1,
+      votingPeriodEnd,
+      quorumThreshold,
+      majorityThreshold,
+      totalSupply,
+      executorMasterCid
+
+  -- Verify proposal is created
+  proposal1 <- queryContractId alice proposalCid1
+  assertMsg "Proposal ID does not match" (proposal1.id == proposalId1)
+  assertMsg "Proposer is not Alice" (proposal1.proposer == alice)
+  debug "Proposal PROP-001 created successfully."
+
+  -- --- Voting Period ---
+  -- Alice votes FOR
+  (aliceVoteCid, _) <- submit alice do exercise aliceTokenCid CastVote with proposalCid = proposalCid1, voteDecision = For
+  debug "Alice voted FOR PROP-001."
+
+  -- Bob votes FOR
+  (bobVoteCid, _) <- submit bob do exercise bobTokenCid CastVote with proposalCid = proposalCid1, voteDecision = For
+  debug "Bob voted FOR PROP-001."
+
+  -- Charlie votes AGAINST
+  (charlieVoteCid, _) <- submit charlie do exercise charlieTokenCid CastVote with proposalCid = proposalCid1, voteDecision = Against
+  debug "Charlie voted AGAINST PROP-001."
+
+  -- --- Assertions during voting ---
+  debug "Verifying voting rules..."
+  -- Try to vote twice (should fail)
+  submitMustFail alice do exercise aliceTokenCid CastVote with proposalCid = proposalCid1, voteDecision = Against
+  debug "  - Verified: A party cannot vote twice on the same proposal."
+
+  -- Try to tally before voting ends (should fail)
+  submitMustFail alice do exercise proposalCid1 TallyVotes with voterTokenCids = [aliceTokenCid, bobTokenCid, charlieTokenCid]
+  debug "  - Verified: Votes cannot be tallied before the voting period ends."
+
+  -- --- Tallying Votes ---
+  -- Advance time past the voting deadline
+  let tallyTime = addRelTime now (days (votingPeriodDays + 1))
+  _ <- setTime tallyTime
+  debug $ "Time advanced past voting deadline to " <> show tallyTime
+
+  -- Any participant can trigger the tally
+  (passedProposalCid, executedActionCid) <- submit alice do
+    exercise proposalCid1 TallyVotes with voterTokenCids = [aliceTokenCid, bobTokenCid, charlieTokenCid]
+  debug "Votes tallied successfully for PROP-001. Proposal passed."
+
+  -- Verify the proposal is now a PassedProposal
+  passedProposal <- queryContractId daoOperator passedProposalCid
+  assertMsg "Passed proposal ID does not match" (passedProposal.id == proposalId1)
+
+  -- Verify the correct action contract was created
+  let Some (treasurySpendActionCid: ContractId TreasurySpendAction) = fromAnyContractId executedActionCid
+  treasurySpendAction <- queryContractId daoOperator treasurySpendActionCid
+  assertMsg "Spend action amount is incorrect" (treasurySpendAction.amount == spendAmount1)
+  assertMsg "Spend action recipient is incorrect" (treasurySpendAction.recipient == recipient)
+
+  -- --- Executing the Proposal ---
+  -- The DAO operator executes the passed proposal
+  submit daoOperator do exercise passedProposalCid Execute
+  debug "Passed proposal PROP-001 executed successfully."
+
+  -- Verify treasury was updated
+  updatedExecutor <- queryContractId daoOperator executorMasterCid
+  assertMsg "Treasury was not debited correctly" (updatedExecutor.treasury == 9000.0)
+  debug "Treasury balance updated correctly to 9000.0."
+
+
+  -- === 3. TEST: FAILED PROPOSAL (REJECTED) ===
+  debug "\n--- Running Test: Failed Proposal (Rejected by Vote) ---"
+  let
+    proposalId2 = "PROP-002"
+    proposalDescription2 = "A controversial proposal that should be rejected."
+
+  -- Charlie submits a proposal
+  proposalCid2 <- submit charlie do
+    exercise charlieTokenCid SubmitTreasurySpendProposal with
+      proposalId = proposalId2,
+      description = proposalDescription2,
+      recipient,
+      amount = 50.0,
+      votingPeriodEnd,
+      quorumThreshold,
+      majorityThreshold,
+      totalSupply,
+      executorMasterCid
+
+  -- Alice votes AGAINST (500 votes)
+  (aliceVoteCid2, _) <- submit alice do exercise aliceTokenCid CastVote with proposalCid = proposalCid2, voteDecision = Against
+  -- Bob votes FOR (200 votes)
+  (bobVoteCid2, _) <- submit bob do exercise bobTokenCid CastVote with proposalCid = proposalCid2, voteDecision = For
+
+  -- Advance time and tally
+  _ <- setTime tallyTime
+  (failedProposalCid, _) <- submit charlie do exercise proposalCid2 TallyVotes with voterTokenCids = [aliceTokenCid, bobTokenCid]
+
+  -- Verify it became a FailedProposal with reason Rejected
+  failedProposal <- queryContractId charlie failedProposalCid
+  assertMsg "Failed proposal ID mismatch" (failedProposal.id == proposalId2)
+  assertMsg "Failure reason should be Rejected" (failedProposal.reason == Rejected)
+  debug "Proposal PROP-002 correctly failed due to vote rejection."
+
+
+  -- === 4. TEST: FAILED PROPOSAL (QUORUM NOT MET) ===
+  debug "\n--- Running Test: Failed Proposal (Quorum Not Met) ---"
+  let
+    proposalId3 = "PROP-003"
+    proposalDescription3 = "A proposal with low voter turnout."
+
+  -- Bob submits a proposal
+  proposalCid3 <- submit bob do
+    exercise bobTokenCid SubmitTreasurySpendProposal with
+      proposalId = proposalId3,
+      description = proposalDescription3,
+      recipient,
+      amount = 10.0,
+      votingPeriodEnd,
+      quorumThreshold,
+      majorityThreshold,
+      totalSupply,
+      executorMasterCid
+
+  -- Only Charlie votes (100 tokens), which is 10% of total supply, below the 40% quorum
+  (charlieVoteCid3, _) <- submit charlie do exercise charlieTokenCid CastVote with proposalCid = proposalCid3, voteDecision = For
+
+  -- Advance time and tally
+  _ <- setTime tallyTime
+  (failedProposalCid2, _) <- submit bob do exercise proposalCid3 TallyVotes with voterTokenCids = [charlieTokenCid]
+
+  -- Verify it became a FailedProposal with reason QuorumNotMet
+  failedProposal2 <- queryContractId bob failedProposalCid2
+  assertMsg "Failed proposal ID mismatch" (failedProposal2.id == proposalId3)
+  assertMsg "Failure reason should be QuorumNotMet" (failedProposal2.reason == QuorumNotMet)
+  debug "Proposal PROP-003 correctly failed due to lack of quorum."
+
+
+  -- === 5. TEST: INVALID VOTE (AFTER DEADLINE) ===
+  debug "\n--- Running Test: Invalid Vote (After Deadline) ---"
+  let proposalId4 = "PROP-004"
+
+  proposalCid4 <- submit alice do
+    exercise aliceTokenCid SubmitTreasurySpendProposal with
+      proposalId = proposalId4,
+      description = "A proposal to test deadlines.",
+      recipient,
+      amount = 1.0,
+      votingPeriodEnd,
+      quorumThreshold,
+      majorityThreshold,
+      totalSupply,
+      executorMasterCid
+
+  -- Advance time past the deadline
+  _ <- setTime tallyTime
+
+  -- Bob tries to vote (should fail)
+  submitMustFail bob do exercise bobTokenCid CastVote with proposalCid = proposalCid4, voteDecision = For
+  debug "Verified: Cannot cast a vote after the deadline."
+
+  pure ()
