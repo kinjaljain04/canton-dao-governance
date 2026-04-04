@@ -1,0 +1,134 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module Executor where
+
+import Daml.Script
+import DA.Time (Time)
+
+import Proposal (Proposal(..), Action(..))
+import GovernanceToken (Treasury(..))
+
+-- | The Executor contract is created for a passed proposal and is responsible for
+-- | carrying out the on-chain action specified in that proposal. It acts as a
+-- | controlled wrapper for the DAO's authority, allowing a designated operator
+-- | to trigger the execution logic.
+template Executor
+  with
+    operator: Party
+      -- ^ The party acting as a "keeper" or automation agent to trigger execution.
+    dao: Party
+      -- ^ The party representing the DAO, which is the ultimate authority for on-chain actions.
+    proposalCid: ContractId Proposal
+      -- ^ The contract ID of the proposal that has been approved by voters.
+  where
+    signatory operator, dao
+
+    observer proposal.proposer
+
+    key (operator, dao, proposalCid) : (Party, Party, ContractId Proposal)
+    maintainer key._1
+
+    -- | Triggers the execution of the associated proposal's action.
+    -- | This choice can only be exercised after the voting period has ended and
+    -- | if the proposal has met its passing criteria (quorum and majority).
+    choice Execute : ()
+      with
+        -- | The specific treasury contract to use for a spending proposal.
+        treasuryCid: ContractId Treasury
+      controller operator
+      do
+        -- Fetch the full proposal contract to verify its state and get its details.
+        proposal <- fetch proposalCid
+
+        -- Get the current ledger time to ensure the voting period is over.
+        now <- getTime
+
+        -- === PRE-EXECUTION CHECKS ===
+
+        -- 1. Verify the voting period has concluded.
+        assertMsg "Cannot execute proposal: voting period is still active."
+          (now > proposal.votingEndsAt)
+
+        -- 2. Verify the proposal hasn't already been executed.
+        assertMsg "Cannot execute proposal: it has already been executed."
+          (not proposal.executed)
+
+        -- 3. Verify the proposal met the conditions to pass.
+        let
+          totalVotes = proposal.yesVotes + proposal.noVotes
+          passedQuorum = totalVotes >= proposal.quorumThreshold
+          passedMajority = proposal.yesVotes > proposal.noVotes
+
+        assertMsg ("Cannot execute proposal: it did not pass. " <>
+                   "Votes: " <> show proposal.yesVotes <> " Yes / " <> show proposal.noVotes <> " No. " <>
+                   "Quorum: " <> show totalVotes <> "/" <> show proposal.quorumThreshold)
+          (passedQuorum && passedMajority)
+
+        -- === EXECUTION LOGIC ===
+
+        -- Use a 'case' statement to handle different types of proposal actions.
+        -- The `dao`'s signatory authority on this Executor contract is inherited by
+        -- this choice, allowing it to exercise choices on other contracts (like Treasury)
+        -- where the `dao` is a required controller.
+        case proposal.action of
+          SpendTreasury recipient amount -> do
+            debug $ "Executing treasury spend to " <> show recipient <> " for amount " <> show amount
+            exercise treasuryCid Spend with
+              recipient = recipient
+              spendAmount = amount
+
+          ChangeParameter key value -> do
+            -- In a more complex DAO, this would exercise a choice on a DAOParameters contract.
+            -- This demonstrates how different actions can be routed.
+            -- e.g., exercise daoParamsCid Update with key, value
+            debug $ "Executing parameter change: set '" <> key <> "' to '" <> value <> "'"
+            -- For this example, this action has no on-ledger effect.
+
+        -- After successful execution, mark the proposal as executed to prevent re-execution.
+        -- This choice must be controlled by the `dao`.
+        exercise proposalCid MarkAsExecuted
+
+        -- Finally, archive this executor contract as its job is done.
+        archive self
+
+-- | Helper script to set up an Executor for testing purposes.
+setupExecutorForTest: Script (ContractId Executor)
+setupExecutorForTest = script do
+  -- Allocate parties
+  operator <- allocateParty "Operator"
+  dao <- allocateParty "DAO"
+  proposer <- allocateParty "Proposer"
+
+  -- Get time for proposal
+  now <- getTime
+  let
+    votingStart = now
+    votingEnd = addDays 7 votingStart
+
+  -- Create a proposal that has already passed (for testing execution)
+  proposalCid <- submit dao do
+    create Proposal with
+      proposer = proposer
+      dao = dao
+      title = "Test Spend Proposal"
+      description = "Spend 100.0 from treasury"
+      action = SpendTreasury with recipient = proposer, amount = 100.0
+      quorumThreshold = 1000.0
+      votingStartsAt = subTime votingEnd (days 10) -- In the past
+      votingEndsAt = subTime votingEnd (days 3) -- In the past
+      yesVotes = 1200.0
+      noVotes = 150.0
+      voters = []
+      executed = False
+
+  -- Create the Executor contract
+  executorCid <- submitMulti [operator, dao] [] do
+    create Executor with
+      operator = operator
+      dao = dao
+      proposalCid = proposalCid
+
+  return executorCid
