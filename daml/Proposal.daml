@@ -5,180 +5,211 @@
 
 module Proposal where
 
-import DA.Time (Time)
-import DA.Assert ((===))
-import GovernanceToken (Token)
+import Daml.Script
+import DA.Date as D
+import DA.Set (Set)
+import qualified DA.Set as Set
+import DA.Optional (isSome, fromSome)
+import DA.Action (when)
+import DA.Time (addRelTime)
+import DA.Foldable (forA_, sum, foldlA)
+import DA.Text (show)
 
--- | Represents the different on-chain actions a proposal can trigger upon success.
--- In a real-world scenario, the `Action` type would be extended to cover all
--- possible governable actions within the DAO's ecosystem.
-data Action =
-    -- | Transfers a specified amount from the DAO treasury to a recipient.
-    TransferFromTreasury with
-      recipient : Party
+-- This would typically be a dependency from a shared token package.
+-- For this example, we define a minimal interface.
+module Token where
+  template I
+    with
+      owner : Party
       amount : Decimal
-      treasuryCid: ContractId Treasury -- Reference to the DAO's treasury contract.
-  | -- | Updates the DAO's quorum threshold for future proposals.
-    UpdateQuorumThreshold with
-      newQuorumThreshold : Decimal
-      daoParametersCid: ContractId DAOParameters -- Reference to the DAO's parameters contract.
-  | -- | Updates the DAO's voting period duration for future proposals.
-    UpdateVotingPeriod with
-      newVotingPeriodSecs : Int
-      daoParametersCid: ContractId DAOParameters -- Reference to the DAO's parameters contract.
-  deriving (Eq, Show)
+    where
+      interface instance I for I where
+        view = View with owner; amount
 
--- | Represents the lifecycle status of a proposal.
-data ProposalState =
-    Voting      -- The proposal is active and accepting votes.
-  | Succeeded   -- The voting period ended, quorum was met, and the vote passed.
-  | Failed      -- The voting period ended, and the proposal failed (either by vote or lack of quorum).
-  | Executed    -- The proposal was successful and its action has been executed.
-  deriving (Eq, Show)
-
--- | The core template for a DAO governance proposal.
--- It encapsulates the proposed action, voting mechanics, and lifecycle state.
-template Proposal
+-- | Represents a user's choice to delegate their voting power to another party.
+-- This contract acts as a standing authorization for the delegate to vote on the
+-- voter's behalf. It is keyed by the voter and the DAO, ensuring one delegation
+-- per voter within a given DAO.
+template Delegation
   with
-    dao: Party                 -- The legal entity or main party of the DAO.
-    proposer: Party            -- The token holder who submitted the proposal.
-    proposalId: Text           -- Unique identifier for the proposal, scoped by the DAO.
-    description: Text          -- Human-readable description of the proposal's purpose.
-    action: Action             -- The on-chain action to be executed if the proposal passes.
-    votingEnd: Time            -- Timestamp when the voting period concludes.
-    quorumThreshold: Decimal   -- Percentage of total supply needed to vote for validity (e.g., 0.1 for 10%).
-    totalTokenSupply: Decimal  -- Total token supply at the moment of proposal creation.
-    votesFor: Decimal          -- Sum of token weights for "yes" votes.
-    votesAgainst: Decimal      -- Sum of token weights for "no" votes.
-    voters: [Party]            -- List of parties who have already cast a vote to prevent double voting.
-    state: ProposalState       -- The current state of the proposal.
+    voter: Party
+    delegate: Party
+    dao: Party
   where
-    signatory dao, proposer
-    observer voters
+    signatory voter
+    observer delegate, dao
 
-    key (dao, proposalId) : (Party, Text)
+    key (voter, dao) : (Party, Party)
     maintainer key._1
 
-    ensure
-      totalTokenSupply > 0.0 &&
-      quorumThreshold > 0.0 && quorumThreshold < 1.0
-
-    -- | A token holder exercises this choice to cast their vote.
-    -- The controller must prove ownership of a `GovernanceToken.Token` contract.
-    choice Vote: ContractId Proposal
+    -- | Allows the voter to change their delegate without revoking and re-creating
+    -- the delegation.
+    choice ChangeDelegate : ContractId Delegation
       with
-        voterTokenCid: ContractId Token -- The voter provides their token contract to prove ownership and weight.
-        support: Bool                    -- True for a "For" vote, False for an "Against" vote.
-      controller (signatory voterTokenCid)
+        newDelegate: Party
+      controller voter
       do
-        -- Ensure voting is currently active.
+        assertMsg "New delegate cannot be the same as the current delegate" (newDelegate /= delegate)
+        create this with delegate = newDelegate
+
+    -- | Allows the voter to revoke their delegation entirely.
+    choice RevokeDelegation : ()
+      controller voter
+      do pure ()
+
+-- | Defines the possible votes a user can cast.
+data VoteType = For | Against | Abstain
+  deriving (Eq, Show, Ord)
+
+-- | Defines the lifecycle status of a governance proposal.
+data ProposalStatus = Pending | Active | Succeeded | Defeated | Executed | Expired
+  deriving (Eq, Show, Ord)
+
+-- | Main proposal contract. It holds the definition, voting state, and execution
+-- logic for a single governance proposal.
+template Proposal
+  with
+    dao: Party
+    proposer: Party
+    proposalId: Text
+    title: Text
+    description: Text
+    -- | The on-chain action to run if the proposal passes.
+    -- `Optional` allows for proposals that don't execute anything (e.g., signaling proposals).
+    executionPayload: Optional (Update (ContractId Proposal))
+    votingPeriod: D.RelTime
+    quorumThreshold: Decimal -- e.g., 0.10 for 10% of total supply
+    majorityThreshold: Decimal -- e.g., 0.50 for >50% of (For + Against) votes
+    creationTime: Time
+    -- | Tracks parties who have already voted to prevent double-voting.
+    -- With delegation, we track the original token holders (voters), not just the delegates.
+    voters: Set Party
+    votesFor: Decimal
+    votesAgainst: Decimal
+    votesAbstain: Decimal
+    totalPowerVoted: Decimal
+    totalSupply: Decimal
+    status: ProposalStatus
+  where
+    signatory dao
+    observer proposer, (Set.toList voters)
+
+    let expiryTime = addRelTime creationTime votingPeriod
+
+    ensure status /= Expired ==> expiryTime >= creationTime
+      && quorumThreshold >= 0.0 && quorumThreshold <= 1.0
+      && majorityThreshold >= 0.0 && majorityThreshold <= 1.0
+      && totalSupply > 0.0
+
+    -- | Helper function to check if the voting period is currently active.
+    let isVotingActive (t: Time) = status == Active && t < expiryTime
+
+    -- | Casts a vote on the proposal.
+    -- This choice implements the core voting logic, including support for delegation.
+    -- A party can vote with their own tokens and, if they are a delegate, with the
+    -- power of those who have delegated to them.
+    choice Vote : ContractId Proposal
+      with
+        -- | The party submitting the vote transaction. Can be a direct voter or a delegate.
+        caster: Party
+        support: VoteType
+        -- | To vote, the caster must provide proof of their own token ownership via CIDs.
+        ownTokenCids: [ContractId Token.I]
+        -- | For each party that delegated to the caster, the caster must provide the
+        -- delegator's party ID and their corresponding token contract IDs.
+        -- This design requires an off-ledger coordination step where delegators
+        -- make their token CIDs available to their chosen delegate. This makes the
+        -- source of all voting power explicit and verifiable on-chain for each vote.
+        delegatedVotes: [(Party, [ContractId Token.I])]
+      controller caster
+      do
         now <- getTime
-        assertMsg "Voting period has ended" (now < votingEnd)
-        assertMsg "Proposal is not in a voting state" (state === Voting)
+        assertMsg "Voting period is not active" (isVotingActive now)
 
-        -- Fetch the voter's token contract to verify ownership and get vote weight.
-        voterToken <- fetch voterTokenCid
-        let voter = voterToken.owner
-        let voteWeight = voterToken.amount
+        -- 1. Calculate and validate caster's own voting power.
+        ownTokens <- mapA fetch ownTokenCids
+        let ownPower = sum $ map (.amount) ownTokens
+        forA_ ownTokens (\token -> assertMsg ("Token not owned by caster " <> show caster) (token.owner == caster))
 
-        -- Ensure the voter has not already voted on this proposal.
-        assertMsg "Voter has already voted on this proposal" (notElem voter voters)
-        assertMsg "Voter must hold a positive token balance to vote" (voteWeight > 0.0)
+        -- 2. Calculate and validate delegated voting power.
+        (delegatedPower, delegators) <- calculateDelegatedPower caster delegatedVotes
 
-        -- Update vote counts based on the voter's choice and token weight.
-        let newVotesFor = if support then votesFor + voteWeight else votesFor
-        let newVotesAgainst = if not support then votesAgainst + voteWeight else votesAgainst
+        -- 3. Prevent double voting by checking both the caster and all delegators.
+        let allVoters = Set.insert caster delegators
+        assertMsg "One or more parties have already voted on this proposal" (Set.null $ Set.intersection voters allVoters)
 
-        -- Recreate the proposal with updated vote counts and voter list.
+        -- 4. Tally votes and update the proposal state.
+        let totalVotePower = ownPower + delegatedPower
+        let (newVotesFor, newVotesAgainst, newVotesAbstain) = case support of
+              For     -> (votesFor + totalVotePower, votesAgainst, votesAbstain)
+              Against -> (votesFor, votesAgainst + totalVotePower, votesAbstain)
+              Abstain -> (votesFor, votesAgainst, votesAbstain + totalVotePower)
+
         create this with
-          votesFor = newVotesFor
-          votesAgainst = newVotesAgainst
-          voters = voter :: voters
+          voters = voters `Set.union` allVoters
+          , votesFor = newVotesFor
+          , votesAgainst = newVotesAgainst
+          , votesAbstain = newVotesAbstain
+          , totalPowerVoted = totalPowerVoted + totalVotePower
 
-    -- | Anyone can trigger this choice after the voting period to finalize the result.
+    where
+      -- | Helper function to process delegated votes. It verifies each delegation
+      -- and aggregates the voting power. This function is defined in a `where`
+      -- block to keep the main choice body clean and readable.
+      calculateDelegatedPower: Party -> [(Party, [ContractId Token.I])] -> Update (Decimal, Set Party)
+      calculateDelegatedPower caster delegatedData = do
+        totalDelegatedPower <- foldlA (\acc (voter, cids) -> do
+          -- Verify that the voter has actually delegated to the caster by fetching
+          -- the `Delegation` contract by its key. This fails if no such delegation exists.
+          delegation <- fetchByKey @Delegation (voter, dao)
+          assertMsg ("Party " <> show voter <> " has not delegated to " <> show caster) (delegation.delegate == caster)
+
+          -- Fetch tokens and calculate voting power for this specific delegator.
+          tokens <- mapA fetch cids
+          let power = sum $ map (.amount) tokens
+          forA_ tokens (\token -> assertMsg ("Token not owned by delegator " <> show voter) (token.owner == voter))
+
+          return (acc + power)
+          ) 0.0 delegatedData
+
+        let delegators = Set.fromList $ map fst delegatedData
+        return (totalDelegatedPower, delegators)
+
+    -- | Tallies the results after the voting period has ended.
+    -- This choice transitions the proposal from `Active` to `Succeeded` or `Defeated`.
     choice Tally: ContractId Proposal
-      controller voters, dao, proposer -- Any interested party can trigger the tally.
+      controller dao
       do
-        -- Ensure the voting period is over and the proposal is ready to be tallied.
         now <- getTime
-        assertMsg "Voting period has not yet ended" (now >= votingEnd)
-        assertMsg "Proposal is not in a voting state" (state === Voting)
+        assertMsg "Voting period has not yet ended" (now >= expiryTime)
+        assertMsg "Proposal must be in Active state to be tallied" (status == Active)
 
-        let totalVotes = votesFor + votesAgainst
-        let quorumMet = (totalVotes / totalTokenSupply) >= quorumThreshold
-        let majorityFor = votesFor > votesAgainst
+        let quorumMet = totalPowerVoted / totalSupply >= quorumThreshold
+        if not quorumMet then
+          create this with status = Defeated
+        else
+          let totalForAndAgainst = votesFor + votesAgainst
+          if totalForAndAgainst == 0.0 then
+             -- Quorum met only with Abstain votes. Proposal is defeated.
+            create this with status = Defeated
+          else
+            -- Majority is calculated as > majorityThreshold of non-abstaining votes.
+            let majorityForMet = votesFor / totalForAndAgainst > majorityThreshold
+            if majorityForMet then
+              create this with status = Succeeded
+            else
+              create this with status = Defeated
 
-        -- Determine the final state based on the tally.
-        let newState =
-              if quorumMet && majorityFor then Succeeded
-              else Failed
-
-        create this with state = newState
-
-    -- | The DAO can execute the proposal's action if it succeeded.
-    choice Execute: ContractId Proposal
+    -- | Executes the proposal's on-chain payload if it was successful.
+    choice Execute : ContractId Proposal
       controller dao
       do
-        assertMsg "Proposal must be in 'Succeeded' state to be executed" (state === Succeeded)
+        assertMsg "Proposal did not succeed" (status == Succeeded)
+        assertMsg "Proposal has no execution payload" (isSome executionPayload)
+        assertMsg "Proposal has already been executed" (status /= Executed)
 
-        -- Perform the on-chain action defined in the proposal.
-        case action of
-          TransferFromTreasury recipient amount treasuryCid ->
-            exercise treasuryCid Spend with recipient, amount
-          UpdateQuorumThreshold newQuorumThreshold daoParametersCid ->
-            exercise daoParametersCid UpdateQuorum with newQuorum = newQuorumThreshold
-          UpdateVotingPeriod newVotingPeriodSecs daoParametersCid ->
-            exercise daoParametersCid UpdateVotingPeriod with newPeriod = newVotingPeriodSecs
-
-        -- Transition the proposal to the 'Executed' state to prevent re-execution.
-        create this with state = Executed
-
-
--- NOTE: The following templates are placeholders to make the `Proposal.Execute` choice
--- fully functional and compilable. In a complete project, these would reside in their
--- own respective files (e.g., `Treasury.daml`, `DAO.daml`).
-
--- | A placeholder for the DAO's treasury contract.
-template Treasury
-  with
-    dao: Party
-    balance: Decimal
-  where
-    signatory dao
-
-    choice Spend: ContractId Treasury
-      with
-        recipient: Party
-        amount: Decimal
-      controller dao
-      do
-        assertMsg "Spend amount must be positive" (amount > 0.0)
-        assertMsg "Insufficient funds in treasury" (amount <= balance)
-        -- In a real implementation, this would likely create an asset contract
-        -- for the recipient rather than just decrementing a balance.
-        create this with balance = balance - amount
-
--- | A placeholder for the DAO's core parameters contract.
-template DAOParameters
-  with
-    dao: Party
-    quorumThreshold: Decimal
-    votingPeriodSecs: Int
-  where
-    signatory dao
-
-    choice UpdateQuorum: ContractId DAOParameters
-      with
-        newQuorum: Decimal
-      controller dao
-      do
-        assertMsg "New quorum must be between 0.0 and 1.0" (newQuorum > 0.0 && newQuorum < 1.0)
-        create this with quorumThreshold = newQuorum
-
-    choice UpdateVotingPeriod: ContractId DAOParameters
-      with
-        newPeriod: Int
-      controller dao
-      do
-        assertMsg "New voting period must be a positive number of seconds" (newPeriod > 0)
-        create this with votingPeriodSecs = newPeriod
+        -- The payload is an `Update` action that gets executed here. It is expected
+        -- to return the ContractId of the modified Proposal contract.
+        updatedProposalCid <- fromSome executionPayload
+        updatedProposal <- fetch updatedProposalCid
+        create updatedProposal with status = Executed
